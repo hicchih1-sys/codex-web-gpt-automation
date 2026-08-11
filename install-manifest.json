@@ -33,6 +33,7 @@
     "bin/oracle-compat/0.17.1/thinkingTime.strict.pre-advanced-view-sibling.patch",
     "bin/oracle-compat/0.17.1/thinkingTime.strict.pre-stable-pro-proof.patch",
     "bin/oracle-compat/0.17.1/thinkingTime.strict.pre-menu-scoped-proof.patch",
+    "bin/oracle-compat/0.17.1/thinkingTime.strict.pre-current-unified-proof.patch",
     "bin/chatgpt_oracle_state.py",
     "bin/chatgpt_oracle_profiles.py",
     "bin/chatgpt_oracle_dispatch.py",
