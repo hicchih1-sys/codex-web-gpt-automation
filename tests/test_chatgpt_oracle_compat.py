@@ -173,12 +173,12 @@ def test_published_0171_patch_requires_extra_high_and_pro_selection_proof(tmp_pa
     )
     assert syntax.returncode == 0, syntax.stderr
     assert compat.sha256_file(target) == compat.PATCHES["dist/src/browser/actions/thinkingTime.js"]["patched"]
-    slider_script = (
+    extra_high_script = (
         f"import {{ ensureThinkingTime }} from {json.dumps(target.as_uri())};"
         "const hiddenView={textContent:'',querySelector:()=>null,"
         "getAttribute:(name)=>name==='aria-hidden'?'true':null,"
         "getBoundingClientRect:()=>({width:0,height:0}),focus:()=>{},dispatchEvent:()=>true};"
-        "const view={textContent:'Pro,\\u200b 5\\u00a0of\\u202f5.Use Left and Right arrow keys to adjust power.',"
+        "const view={textContent:'Extra High,\\u200b 4\\u00a0of\\u202f5.Use Left and Right arrow keys to adjust power.',"
         "querySelector:()=>null,getAttribute:()=>null,getBoundingClientRect:()=>({width:224,height:40}),"
         "focus:()=>{},dispatchEvent:()=>true};"
         "globalThis.document={querySelector:()=>null,querySelectorAll:(selector)=>selector.includes("
@@ -188,21 +188,21 @@ def test_published_0171_patch_requires_extra_high_and_pro_selection_proof(tmp_pa
         "const logs=[];"
         "const Runtime={evaluate:async({expression})=>{const value=await eval(expression);"
         "return {result:{value}};}};"
-        "await ensureThinkingTime(Runtime,'heavy',(message)=>logs.push(message),'gpt-5.6-sol');"
+        "await ensureThinkingTime(Runtime,'extra-high',(message)=>logs.push(message),'gpt-5.6-sol');"
         "console.log(JSON.stringify(logs));"
     )
-    slider = subprocess.run(
-        [node, "--input-type=module", "-e", slider_script],
+    extra_high = subprocess.run(
+        [node, "--input-type=module", "-e", extra_high_script],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert slider.returncode == 0, slider.stderr
-    assert json.loads(slider.stdout) == ["[browser] Thinking time: Power 5 of 5 (already selected)"]
+    assert extra_high.returncode == 0, extra_high.stderr
+    assert json.loads(extra_high.stdout) == ["[browser] Thinking time: Power 4 of 5 (already selected)"]
 
     exact_diagnostic_script = (
         f"import {{ ensureThinkingTime }} from {json.dumps(target.as_uri())};"
-        "let menuOpen=false;"
+        "let menuOpen=true;"
         "let advancedQueries=0;"
         "const hiddenView={textContent:'Pro, 5 of 5.Use Left and Right arrow keys to adjust power.',"
         "querySelector:()=>null,getAttribute:(name)=>name==='aria-hidden'?'true':null,"
@@ -225,7 +225,7 @@ def test_published_0171_patch_requires_extra_high_and_pro_selection_proof(tmp_pa
         "querySelectorAll:()=>[],getAttribute:()=>null,"
         "getBoundingClientRect:()=>({width:320,height:240})};"
         "const modelButton=new class extends EventTarget{"
-        "get textContent(){return menuOpen?'Pro':'Extra High'}"
+        "get textContent(){return 'Pro'}"
         "querySelector(){return null}matches(){return true}get isConnected(){return true}"
         "getAttribute(name){if(name==='aria-expanded')return menuOpen?'true':'false';return null}"
         "getBoundingClientRect(){return {width:120,height:36}}focus(){}"
@@ -244,7 +244,7 @@ def test_published_0171_patch_requires_extra_high_and_pro_selection_proof(tmp_pa
         "const logs=[];"
         "const Runtime={evaluate:async({expression})=>{const value=await eval(expression);"
         "return {result:{value}};}};"
-        "await ensureThinkingTime(Runtime,'heavy',(message)=>logs.push(message));"
+        "await ensureThinkingTime(Runtime,'heavy',(message)=>logs.push(message),'gpt-5.6-sol');"
         "console.log(JSON.stringify({logs,advancedQueries}));"
     )
     exact_diagnostic = subprocess.run(
@@ -259,6 +259,61 @@ def test_published_0171_patch_requires_extra_high_and_pro_selection_proof(tmp_pa
     assert exact_payload["logs"] == [
         "[browser] Thinking time: Power 5 of 5 (Pro) (already selected)"
     ]
+
+    def run_negative_picker_case(simple_text: str, advanced_text: str, aria_value: str) -> dict[str, object]:
+        script = (
+            f"import {{ ensureThinkingTime }} from {json.dumps(target.as_uri())};"
+            f"const simpleText={json.dumps(simple_text)};"
+            f"const advancedText={json.dumps(advanced_text)};"
+            f"const ariaValue={json.dumps(aria_value)};"
+            "const view={textContent:simpleText,querySelector:()=>({getAttribute:(name)=>"
+            "name==='aria-valuenow'?ariaValue:null,focus:()=>{},dispatchEvent:()=>true}),getAttribute:()=>null,"
+            "getBoundingClientRect:()=>({width:224,height:40}),focus:()=>{},dispatchEvent:()=>true};"
+            "const advanced={textContent:advancedText,querySelector:()=>null,querySelectorAll:()=>[],"
+            "getAttribute:()=>null,getBoundingClientRect:()=>({width:224,height:76})};"
+            "const modelButton={textContent:'Pro',querySelector:()=>null,matches:()=>true,"
+            "getAttribute:(name)=>name==='aria-expanded'?'true':null,"
+            "getBoundingClientRect:()=>({width:166,height:36}),focus:()=>{},dispatchEvent:()=>true};"
+            "globalThis.window=globalThis;"
+            "globalThis.MouseEvent=class{constructor(type,init){this.type=type;Object.assign(this,init)}};"
+            "globalThis.KeyboardEvent=class{constructor(type,init){this.type=type;Object.assign(this,init)}};"
+            "globalThis.HTMLElement=class{};"
+            "globalThis.document={querySelector:(selector)=>selector.includes("
+            "'model-switcher-dropdown-button')||selector.includes('__composer-pill')?modelButton:null,"
+            "querySelectorAll:(selector)=>selector.includes('composer-model-picker-slider-simple-view')?"
+            "[view]:selector.includes('composer-model-picker-slider-advanced-view')?"
+            "(advancedText?[advanced]:[]):[],dispatchEvent:()=>true,body:{}};"
+            "const logs=[];"
+            "const Runtime={evaluate:async({expression})=>{const value=await eval(expression);"
+            "return {result:{value}};}};"
+            "let result;try{await ensureThinkingTime(Runtime,'heavy',(message)=>logs.push(message),"
+            "'gpt-5.6-sol');result={ok:true,logs};}catch(error){result={ok:false,error:String(error),logs};}"
+            "console.log(JSON.stringify(result));"
+        )
+        completed = subprocess.run(
+            [node, "--input-type=module", "-e", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout)
+
+    negative_cases = {
+        "lower": run_negative_picker_case(
+            "Extra High, 4 of 5.Use Left and Right arrow keys to adjust power.",
+            "ModelGPT-5.6 SolEffortExtra High",
+            "4",
+        ),
+        "ambiguous": run_negative_picker_case(
+            "Pro, 5 of 5.Use Left and Right arrow keys to adjust power.",
+            "",
+            "5",
+        ),
+    }
+    for case, payload in negative_cases.items():
+        assert payload["ok"] is False, case
+        assert "refusing to submit without confirmed Heavy" in str(payload["error"]), case
 
     browser_config = package / "dist/src/browser/config.js"
     browser_config_text = browser_config.read_text(encoding="utf-8")

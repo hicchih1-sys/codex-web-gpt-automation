@@ -93,7 +93,7 @@ PATCHES = {
     "dist/src/browser/actions/thinkingTime.js": {
         "patch": "thinkingTime.strict.patch",
         "pristine": "508f1fbc175b82e6bfd4c978da6199306800615f432e28d7721c155c402795ca",
-        "patched": "f2244ec9e113cffbae073673c9adc3cfc70adb58a4fc64b241f85700ff3def8c",
+        "patched": "337008d96e0c557d2308783d753f6d0b98432d56a3e78404e02424d7623fbf29",
         "legacy_patched": [
             "536571fccc3f8137bfbf0ea96dfd827f1eabdaf92f93fe7cff92af242ef01d53",
             "fe6db3c1d48ccf7eff212dab7e69a2b3c7439f44b5cc823d474aa4fbd0925151",
@@ -109,6 +109,7 @@ PATCHES = {
             "b55897a9d90627b226e39e77339819e446927ffc66f78181f5c2851cbcfe5f97",
             "3f969712b184588d1f34ef4f55b439c86256d112bb0fa1688bb473b61fd3dcc3",
             "d01b1d254041c35a300d44f7b3940a89d5406bdf30027bdc7c579a074c5ca5f3",
+            "f092258394a46b6f2b75ee8e7c49a31bfb7f7dbb29983a54ecf6073675ad242a",
         ],
         "legacy_patch": "thinkingTime.strict.pre-power.patch",
         "legacy_patches": {
@@ -138,6 +139,8 @@ PATCHES = {
                 "thinkingTime.strict.pre-stable-pro-proof.patch",
             "d01b1d254041c35a300d44f7b3940a89d5406bdf30027bdc7c579a074c5ca5f3":
                 "thinkingTime.strict.pre-menu-scoped-proof.patch",
+            "f092258394a46b6f2b75ee8e7c49a31bfb7f7dbb29983a54ecf6073675ad242a":
+                "thinkingTime.strict.pre-current-unified-proof.patch",
         },
     },
 }
