@@ -111,6 +111,47 @@ def test_unknown_oracle_version_or_file_hash_fails_closed(tmp_path: Path) -> Non
     assert mismatch.value.code == "ORACLE_FILE_HASH_MISMATCH"
 
 
+def test_verified_cli_entry_is_hash_pinned_and_rejects_tampering(tmp_path: Path) -> None:
+    compat = load_compat()
+    package = tmp_path / "oracle"
+    cli = package / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
+    package_json = b'{"name":"@steipete/oracle","version":"0.17.1"}\n'
+    cli_bytes = b'console.log("0.17.1");\n'
+    (package / "package.json").write_bytes(package_json)
+    cli.write_bytes(cli_bytes)
+    compat.ORACLE_PACKAGE_JSON_SHA256 = digest(package_json)
+    compat.ORACLE_CLI_ENTRY_SHA256 = digest(cli_bytes)
+
+    assert compat.resolve_verified_cli_entry(package_root=package) == cli.resolve()
+
+    cli.write_bytes(b'console.log("tampered");\n')
+    with pytest.raises(compat.OracleCompatError) as cli_mismatch:
+        compat.resolve_verified_cli_entry(package_root=package)
+    assert cli_mismatch.value.code == "ORACLE_CLI_HASH_MISMATCH"
+
+    cli.write_bytes(cli_bytes)
+    (package / "package.json").write_bytes(
+        b'{"name":"@steipete/oracle","version":"0.17.1","tampered":true}\n'
+    )
+    with pytest.raises(compat.OracleCompatError) as package_mismatch:
+        compat.resolve_verified_cli_entry(package_root=package)
+    assert package_mismatch.value.code == "ORACLE_PACKAGE_HASH_MISMATCH"
+
+
+def test_candidate_roots_honor_the_cross_platform_npm_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compat = load_compat()
+    package = tmp_path / "_npx" / "exact" / "node_modules" / "@steipete" / "oracle"
+    package.mkdir(parents=True)
+    monkeypatch.delenv("ORACLE_PACKAGE_ROOT", raising=False)
+    monkeypatch.setenv("npm_config_cache", str(tmp_path))
+
+    assert compat._candidate_roots() == [package.resolve()]
+
+
 def test_published_0171_patch_requires_extra_high_and_pro_selection_proof(tmp_path: Path) -> None:
     compat = load_compat()
     source = (

@@ -146,13 +146,14 @@ def classify_run(
             return {"bucket": PRE_SUBMIT_UI, "signature": "thinking-time-selection-unverified"}
         if code != "ORACLE_VERSION_RESOLUTION_PRELAUNCH_FAILED":
             return {"bucket": UNCLASSIFIED, "signature": "unrecognized-pre-submit-host-failure"}
+        failure_reason = str(host_failure.get("failure_reason") or "")
         return {
             "bucket": PRE_SUBMIT_HOST,
-            "signature": (
-                "oracle-version-resolution-prelaunch-compatibility-drift"
-                if host_failure.get("failure_reason") == "compatibility-version-drift"
-                else "oracle-version-resolution-prelaunch-timeout"
-            ),
+            "signature": {
+                "compatibility-version-drift": "oracle-version-resolution-prelaunch-compatibility-drift",
+                "version-resolution-command-failed": "oracle-version-resolution-prelaunch-command-failed",
+                "local-oracle-executable-unavailable": "oracle-local-executable-prelaunch-unavailable",
+            }.get(failure_reason, "oracle-version-resolution-prelaunch-timeout"),
         }
     if lifecycle == "complete":
         if source == "exact-terminal-evidence":
