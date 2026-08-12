@@ -228,6 +228,132 @@ def wait_for_oracle_process(process: Any, watchdog_timeout_seconds: float | None
 
 
 ORACLE_VERSION_RESOLUTION_TIMEOUT_SECONDS = 90
+NODE_VERSION_RESOLUTION_TIMEOUT_SECONDS = 10
+WINDOWS_NODE_CANDIDATES = (
+    Path.home() / "AppData" / "Local" / "Programs" / "LM Studio" / "resources" / "app" / ".webpack" / "bin" / "node.exe",
+)
+_NODE_VERSION_RE = re.compile(r"^v?(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
+_NODE_ENGINE_RE = re.compile(
+    r"^\s*>=\s*(?P<major>\d+)(?:\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?)?\s*$"
+)
+
+
+def _oracle_node_engine(cli_entry: Path) -> tuple[Path, str, tuple[int, int, int]]:
+    try:
+        package_root = cli_entry.parents[2]
+        package_payload = json.loads((package_root / "package.json").read_text(encoding="utf-8"))
+        engine = package_payload["engines"]["node"]
+    except (OSError, IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise OracleRunError(
+            "ORACLE_NODE_ENGINE_INVALID",
+            "The verified Oracle package must declare engines.node",
+            {"package_root": str(cli_entry.parent)},
+        ) from exc
+    if not isinstance(engine, str) or (match := _NODE_ENGINE_RE.fullmatch(engine)) is None:
+        raise OracleRunError(
+            "ORACLE_NODE_ENGINE_UNSUPPORTED",
+            "Oracle engines.node uses an unsupported constraint",
+            {"package_root": str(package_root), "engines_node": engine},
+        )
+    required = tuple(int(match.group(name) or 0) for name in ("major", "minor", "patch"))
+    return package_root, engine, required
+
+
+def _existing_node_candidates(
+    node_name: str,
+    *,
+    platform_name: str,
+    executable_resolver: Callable[[str], str | None],
+    node_candidates: Sequence[Path] | None,
+) -> list[Path]:
+    raw: list[str | Path] = []
+    resolved = executable_resolver(node_name)
+    if resolved:
+        raw.append(resolved)
+    raw.extend(
+        node_candidates
+        if node_candidates is not None
+        else WINDOWS_NODE_CANDIDATES if platform_name == "nt" else ()
+    )
+    existing: list[Path] = []
+    seen: set[str] = set()
+    for value in raw:
+        try:
+            candidate = Path(value).expanduser().resolve(strict=True)
+        except OSError:
+            continue
+        key = str(candidate).casefold() if platform_name == "nt" else str(candidate)
+        if candidate.is_file() and key not in seen:
+            seen.add(key)
+            existing.append(candidate)
+    return existing
+
+
+def _select_compatible_node(
+    cli_entry: Path,
+    *,
+    platform_name: str,
+    executable_resolver: Callable[[str], str | None],
+    node_version_runner: Callable[..., subprocess.CompletedProcess[Any]],
+    node_candidates: Sequence[Path] | None,
+) -> Path:
+    _, engine, required = _oracle_node_engine(cli_entry)
+    node_name = "node.exe" if platform_name == "nt" else "node"
+    candidates = _existing_node_candidates(
+        node_name,
+        platform_name=platform_name,
+        executable_resolver=executable_resolver,
+        node_candidates=node_candidates,
+    )
+    evidence: list[dict[str, Any]] = []
+    compatible: list[tuple[Path, str]] = []
+    for candidate in candidates:
+        try:
+            completed = node_version_runner(
+                [str(candidate), "--version"],
+                cwd=None,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=NODE_VERSION_RESOLUTION_TIMEOUT_SECONDS,
+                check=False,
+                **STATE.windows_subprocess_kwargs(platform_name=platform_name),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            evidence.append({"path": str(candidate), "error": type(exc).__name__, "compatible": False})
+            continue
+        raw_version = str(completed.stdout or completed.stderr or "").strip()
+        match = _NODE_VERSION_RE.fullmatch(raw_version) if completed.returncode == 0 else None
+        if match is None:
+            evidence.append({
+                "path": str(candidate), "error": "invalid-version", "exit_code": completed.returncode,
+                "compatible": False,
+            })
+            continue
+        version_tuple = tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
+        version = ".".join(str(item) for item in version_tuple)
+        is_compatible = version_tuple >= required
+        evidence.append({"path": str(candidate), "version": version, "compatible": is_compatible})
+        if is_compatible:
+            compatible.append((candidate, version))
+    if not compatible:
+        raise OracleRunError(
+            "ORACLE_NODE_COMPATIBLE_NOT_FOUND",
+            "No bounded existing Node.js candidate satisfies Oracle engines.node",
+            {"required": engine, "candidates": evidence},
+        )
+    if len(compatible) != 1:
+        raise OracleRunError(
+            "ORACLE_NODE_SELECTION_AMBIGUOUS",
+            "Multiple bounded Node.js candidates satisfy Oracle engines.node",
+            {
+                "required": engine,
+                "compatible_candidates": [
+                    {"path": str(path), "version": version} for path, version in compatible
+                ],
+            },
+        )
+    return compatible[0][0]
 
 
 def materialize_oracle_command(
@@ -236,6 +362,8 @@ def materialize_oracle_command(
     platform_name: str | None = None,
     cli_resolver: Callable[[], Path] = COMPAT.resolve_verified_cli_entry,
     executable_resolver: Callable[[str], str | None] = shutil.which,
+    node_version_runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+    node_candidates: Sequence[Path] | None = None,
 ) -> list[str]:
     """Replace the pinned npx spec with a hash-verified offline CLI command."""
     validated = STATE.validate_oracle_command(list(command))
@@ -247,28 +375,13 @@ def materialize_oracle_command(
     except COMPAT.OracleCompatError as exc:
         raise OracleRunError(exc.code, str(exc), exc.evidence) from exc
     platform = os.name if platform_name is None else platform_name
-    node_name = "node.exe" if platform == "nt" else "node"
-    node_value = executable_resolver(node_name)
-    if not node_value:
-        raise OracleRunError(
-            "ORACLE_NODE_NOT_FOUND",
-            "Node.js is required to run the verified local Oracle package",
-            {"executable": node_name},
-        )
-    try:
-        node_path = Path(node_value).expanduser().resolve(strict=True)
-    except OSError as exc:
-        raise OracleRunError(
-            "ORACLE_NODE_INVALID",
-            "The resolved Node.js executable is unavailable",
-            {"executable": str(node_value)},
-        ) from exc
-    if not node_path.is_file():
-        raise OracleRunError(
-            "ORACLE_NODE_INVALID",
-            "The resolved Node.js executable is not a regular file",
-            {"executable": str(node_path)},
-        )
+    node_path = _select_compatible_node(
+        cli_entry,
+        platform_name=platform,
+        executable_resolver=executable_resolver,
+        node_version_runner=node_version_runner,
+        node_candidates=node_candidates,
+    )
     return [str(node_path), str(cli_entry)]
 
 
@@ -302,6 +415,59 @@ def materialized_package_root(
             {"entry": str(cli_entry), "relative": relative.as_posix()},
         )
     return package_root
+
+
+def persist_materialized_command(state_path: Path, launch_command: Sequence[str]) -> None:
+    payload = STATE.load_state(state_path)
+    oracle = payload.get("oracle") if isinstance(payload.get("oracle"), dict) else {}
+    payload["oracle"] = {**oracle, "materialized_command": list(launch_command)}
+    STATE.write_json_atomic(state_path, payload)
+
+
+def persisted_materialized_command(
+    logical_command: Sequence[str],
+    value: Any,
+    *,
+    platform_name: str | None = None,
+    node_version_runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) != 2 or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise OracleRunError(
+            "ORACLE_MATERIALIZED_COMMAND_INVALID",
+            "Persisted Oracle runtime command is missing or malformed",
+        )
+    launch_command = list(value)
+    package_root = materialized_package_root(logical_command, launch_command)
+    if package_root is None:
+        raise OracleRunError(
+            "ORACLE_MATERIALIZED_COMMAND_INVALID",
+            "Only a materialized pinned local Oracle command may be persisted",
+        )
+    try:
+        node_path = Path(launch_command[0]).expanduser().resolve(strict=True)
+        cli_entry = Path(launch_command[1]).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise OracleRunError(
+            "ORACLE_MATERIALIZED_COMMAND_INVALID",
+            "Persisted Oracle runtime command is no longer available",
+            {"command": launch_command},
+        ) from exc
+    platform = os.name if platform_name is None else platform_name
+    selected = _select_compatible_node(
+        cli_entry,
+        platform_name=platform,
+        executable_resolver=lambda name: str(node_path),
+        node_version_runner=node_version_runner,
+        node_candidates=(),
+    )
+    if selected != node_path:
+        raise OracleRunError(
+            "ORACLE_MATERIALIZED_COMMAND_INVALID",
+            "Persisted Oracle Node.js selection changed unexpectedly",
+        )
+    return [str(node_path), str(cli_entry)]
 
 
 def resolve_oracle_version(command: Sequence[str], *, run_factory=subprocess.run, platform_name: str | None = None) -> str:
@@ -737,6 +903,7 @@ def execute_run(
             if command_materializer is not None
             else materialize_oracle_command(config.oracle_command, platform_name=platform_name)
         )
+        persist_materialized_command(layout.state_path, launch_command)
         argv = [*launch_command, *argv[len(config.oracle_command):]]
         version = resolve_oracle_version(launch_command, run_factory=run_factory, platform_name=platform_name)
         package_root = materialized_package_root(config.oracle_command, launch_command)
@@ -1021,6 +1188,7 @@ def _recover_run_locked(
     platform_name: str | None = None,
     command_materializer: Callable[[Sequence[str]], Sequence[str]] | None = None,
     recovery_compat_factory: Callable[..., dict[str, Any]] = COMPAT.ensure_oracle_compatibility,
+    node_version_runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
     live_settle_timeout_seconds: float = 0,
 ) -> dict[str, Any]:
     directory = run_dir.expanduser().resolve(strict=True)
@@ -1109,10 +1277,20 @@ def _recover_run_locked(
     argv = recovery_argv(command, locator, action, argv_output)
     if dry_run:
         return {"ok": True, "status": "dry-run", "run_dir": str(directory), "action": action, "argv": STATE.command_for_display(argv)}
-    launch_command = list(
-        command_materializer(command)
-        if command_materializer is not None
-        else materialize_oracle_command(command, platform_name=platform_name)
+    stored_materialized = oracle.get("materialized_command") if oracle_command is None else None
+    launch_command = (
+        persisted_materialized_command(
+            command,
+            stored_materialized,
+            platform_name=platform_name,
+            node_version_runner=node_version_runner,
+        )
+        if stored_materialized is not None
+        else list(
+            command_materializer(command)
+            if command_materializer is not None
+            else materialize_oracle_command(command, platform_name=platform_name)
+        )
     )
     package_root = materialized_package_root(command, launch_command)
     if package_root is not None:
@@ -1622,6 +1800,58 @@ def settle_user_confirmed_no_submission(
     }
 
 
+def settle_commit_probe_no_submission(
+    run_dir: Path,
+    *,
+    meta_path: Path,
+    expected_meta_sha256: str,
+    reason: str,
+    platform_name: str | None = None,
+    session_root: Path | None = None,
+) -> dict[str, Any]:
+    """Settle one exact negative Oracle commit probe without browser activity."""
+    directory = run_dir.expanduser().resolve(strict=True)
+    state_path = directory / "state.json"
+    stored = STATE.load_state(state_path)
+    project_root = Path(str(stored.get("project_root") or "")).expanduser().resolve(strict=True)
+    parallel_parent_id = str(stored.get("parallel_parent_id") or "").strip().casefold()
+    if parallel_parent_id and STATE.PARENT_ID_RE.fullmatch(parallel_parent_id) is None:
+        raise OracleRunError(
+            "SETTLEMENT_PARALLEL_PARENT_ID_INVALID",
+            "stored parallel parent id is invalid",
+            {"parallel_parent_id": parallel_parent_id},
+        )
+    mutex_root = (
+        project_root / ".oracle-parallel-submit" / parallel_parent_id
+        if parallel_parent_id
+        else project_root
+    )
+    try:
+        with STATE.project_submit_mutex(mutex_root, timeout_seconds=30, platform_name=platform_name):
+            settled = STATE.settle_commit_probe_no_submission(
+                state_path,
+                meta_path=meta_path,
+                expected_meta_sha256=expected_meta_sha256,
+                reason=reason,
+                session_root=session_root,
+            )
+            owners = STATE.unresolved_project_sessions(
+                directory.parent,
+                project_root,
+                exclude_run_id=str(settled.get("run_id") or ""),
+            )
+    except STATE.OracleStateError as exc:
+        raise OracleRunError(exc.code, str(exc), exc.evidence) from exc
+    return {
+        "ok": True,
+        "status": "pre_submit_commit_probe_proven",
+        "safe_for_fresh_run": not owners,
+        "unresolved_owners": owners,
+        "run_dir": str(directory),
+        "result": settled,
+    }
+
+
 def recover_run(
     run_dir: Path,
     *,
@@ -1632,6 +1862,7 @@ def recover_run(
     platform_name: str | None = None,
     command_materializer: Callable[[Sequence[str]], Sequence[str]] | None = None,
     recovery_compat_factory: Callable[..., dict[str, Any]] = COMPAT.ensure_oracle_compatibility,
+    node_version_runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
     settle_timeout_seconds: float = 0,
     settle_interval_seconds: float = 15,
     sleep: Callable[[float], None] = time.sleep,
@@ -1665,6 +1896,7 @@ def recover_run(
             platform_name=platform_name,
             command_materializer=command_materializer,
             recovery_compat_factory=recovery_compat_factory,
+            node_version_runner=node_version_runner,
             live_settle_timeout_seconds=settle_timeout_seconds if action == "live" else 0,
         )
         if (
@@ -1727,6 +1959,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     settle_parser.add_argument("--reason", required=True)
+    commit_probe_parser = commands.add_parser("settle-commit-probe-no-submission")
+    commit_probe_parser.add_argument("--run-dir", type=Path, required=True)
+    commit_probe_parser.add_argument("--meta-path", type=Path, required=True)
+    commit_probe_parser.add_argument("--expected-meta-sha256", required=True)
+    commit_probe_parser.add_argument("--reason", required=True)
     execution_settle_parser = commands.add_parser("settle-executed-timeout")
     execution_settle_parser.add_argument("--run-dir", type=Path, required=True)
     execution_settle_parser.add_argument("--expected-output-sha256", required=True)
@@ -1776,6 +2013,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = settle_user_confirmed_no_submission(
                 args.run_dir,
                 confirmation=args.confirmation,
+                reason=args.reason,
+            )
+        elif args.command == "settle-commit-probe-no-submission":
+            payload = settle_commit_probe_no_submission(
+                args.run_dir,
+                meta_path=args.meta_path,
+                expected_meta_sha256=args.expected_meta_sha256,
                 reason=args.reason,
             )
         else:

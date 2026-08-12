@@ -1279,6 +1279,216 @@ def _user_confirmable_no_submission_evidence(state_path: Path) -> dict[str, Any]
     return _web_multi_child_no_submission_evidence(state_path)
 
 
+def _contains_key(value: Any, key: str) -> bool:
+    if isinstance(value, dict):
+        return any(str(name).casefold() == key.casefold() or _contains_key(item, key) for name, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_key(item, key) for item in value)
+    return False
+
+
+def _commit_probe_meta_evidence(
+    state_path: Path,
+    *,
+    meta_path: Path,
+    expected_meta_sha256: str,
+    session_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Bind Oracle's immutable negative commit probe to one canonical run."""
+    state = load_state(state_path)
+    run_dir = state_path.parent.resolve()
+    oracle = state.get("oracle") if isinstance(state.get("oracle"), dict) else {}
+    locator = str(oracle.get("session_locator") or oracle.get("slug") or "").strip()
+    root = (session_root or (Path.home() / ".oracle" / "sessions")).expanduser().resolve()
+    expected_path = root / locator / "meta.json"
+    try:
+        resolved_meta = meta_path.expanduser().resolve(strict=True)
+        if (
+            not locator
+            or resolved_meta != expected_path.resolve()
+            or meta_path.is_symlink()
+            or not resolved_meta.is_file()
+            or not re.fullmatch(r"[a-f0-9]{64}", expected_meta_sha256.strip().casefold())
+        ):
+            return None
+        meta_bytes = resolved_meta.read_bytes()
+        meta_sha256 = hashlib.sha256(meta_bytes).hexdigest()
+        if meta_sha256 != expected_meta_sha256.strip().casefold():
+            return None
+        meta = json.loads(meta_bytes.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    forbidden_url_keys = (
+        "conversationId", "conversationUrl", "conversation_url", "canonicalUrl", "canonical_url",
+    )
+    if not isinstance(meta, dict) or any(_contains_key(meta, key) for key in forbidden_url_keys):
+        return None
+    browser = meta.get("browser") if isinstance(meta.get("browser"), dict) else {}
+    runtime = browser.get("runtime") if isinstance(browser.get("runtime"), dict) else {}
+    options = meta.get("options") if isinstance(meta.get("options"), dict) else {}
+    error = meta.get("error") if isinstance(meta.get("error"), dict) else {}
+    details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    probe = details.get("commitProbe") if isinstance(details.get("commitProbe"), dict) else {}
+    artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), dict) else {}
+    output = Path(str(artifacts.get("output") or ""))
+    browser_temp = Path(str(artifacts.get("browser_temp") or ""))
+    project_root = Path(str(state.get("project_root") or ""))
+    try:
+        user_data_dir = Path(str(runtime.get("userDataDir") or "")).expanduser().resolve()
+        canonical_output = (run_dir / "output.md").resolve()
+        if (
+            not project_root.is_dir()
+            or Path(str(meta.get("cwd") or "")).expanduser().resolve() != project_root.resolve()
+            or output.resolve() != canonical_output
+            or output.is_symlink()
+            or output_is_nonempty(output)
+            or Path(str(options.get("writeOutputPath") or "")).expanduser().resolve() != canonical_output
+            or str(options.get("slug") or "") != locator
+            or browser_temp.resolve() != (run_dir / "browser-temp").resolve()
+            or not is_within(browser_temp.resolve(), user_data_dir)
+            or user_data_dir == browser_temp.resolve()
+        ):
+            return None
+    except OSError:
+        return None
+    tab_url = str(runtime.get("tabUrl") or "").strip()
+    if (
+        meta.get("id") != locator
+        or meta.get("status") != "error"
+        or details.get("stage") != "submit-prompt"
+        or details.get("code") != "prompt-commit-timeout"
+        or probe.get("baseline") != 0
+        or probe.get("turnsCount") != 0
+        or probe.get("userMatched") is not False
+        or probe.get("prefixMatched") is not False
+        or probe.get("lastMatched") is not False
+        or probe.get("hasNewTurn") is not False
+        or probe.get("stopVisible") is not False
+        or probe.get("assistantVisible") is not False
+        or probe.get("composerCleared") is not False
+        or probe.get("inConversation") is not False
+        or tab_url != "https://chatgpt.com/"
+        or _state_has_conversation_url(state)
+    ):
+        return None
+    eligibility = _user_confirmable_no_submission_evidence(state_path)
+    if eligibility is None:
+        return None
+    return {
+        **{key: value for key, value in eligibility.items() if not key.startswith("_")},
+        "meta_path": str(resolved_meta),
+        "meta_sha256": meta_sha256,
+        "meta_status": "error",
+        "commit_probe": {
+            "baseline": 0,
+            "turnsCount": 0,
+            "userMatched": False,
+            "prefixMatched": False,
+            "lastMatched": False,
+            "hasNewTurn": False,
+            "stopVisible": False,
+            "assistantVisible": False,
+            "composerCleared": False,
+            "inConversation": False,
+        },
+        "browser_user_data_dir": str(user_data_dir),
+        "browser_tab_url": tab_url,
+    }
+
+
+def proven_commit_probe_no_submission(
+    state_path: Path,
+    *,
+    session_root: Path | None = None,
+) -> dict[str, Any] | None:
+    state = load_state(state_path)
+    reference = state.get("commit_probe_no_submission")
+    settlement_path = state_path.parent / "commit-probe-no-submission.json"
+    if (
+        not isinstance(reference, dict)
+        or reference.get("schema") != "codex.chatgpt.oracle-settlement-reference/v1"
+        or Path(str(reference.get("path") or "")).resolve() != settlement_path.resolve()
+        or settlement_path.is_symlink()
+    ):
+        return None
+    try:
+        raw = settlement_path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != str(reference.get("sha256") or ""):
+            return None
+        recorded = json.loads(raw.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(recorded, dict)
+        or recorded.get("schema") != "codex.chatgpt.oracle-commit-probe-no-submission/v1"
+        or recorded.get("code") != "ORACLE_COMMIT_PROBE_NO_SUBMISSION"
+        or not str(recorded.get("reason") or "").strip()
+    ):
+        return None
+    current = _commit_probe_meta_evidence(
+        state_path,
+        meta_path=Path(str(recorded.get("meta_path") or "")),
+        expected_meta_sha256=str(recorded.get("meta_sha256") or ""),
+        session_root=session_root,
+    )
+    if current is None:
+        return None
+    comparable = {key: value for key, value in recorded.items() if key not in {"schema", "code", "reason"}}
+    return recorded if comparable == current else None
+
+
+def settle_commit_probe_no_submission(
+    state_path: Path,
+    *,
+    meta_path: Path,
+    expected_meta_sha256: str,
+    reason: str,
+    session_root: Path | None = None,
+) -> dict[str, Any]:
+    payload = load_state(state_path)
+    existing = proven_commit_probe_no_submission(state_path, session_root=session_root)
+    if existing is not None:
+        return payload
+    if str(payload.get("session_authority") or "") != "submitted_unknown":
+        raise OracleStateError("COMMIT_PROBE_AUTHORITY_INVALID", "only submitted_unknown may be commit-probe settled")
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        raise OracleStateError("COMMIT_PROBE_REASON_REQUIRED", "commit-probe settlement reason is required")
+    evidence = _commit_probe_meta_evidence(
+        state_path,
+        meta_path=meta_path,
+        expected_meta_sha256=expected_meta_sha256,
+        session_root=session_root,
+    )
+    if evidence is None:
+        raise OracleStateError("COMMIT_PROBE_EVIDENCE_INVALID", "commit-probe evidence is not bound to this exact run")
+    recorded = {
+        "schema": "codex.chatgpt.oracle-commit-probe-no-submission/v1",
+        "code": "ORACLE_COMMIT_PROBE_NO_SUBMISSION",
+        "reason": normalized_reason,
+        **evidence,
+    }
+    settlement_path = state_path.parent / "commit-probe-no-submission.json"
+    write_json_atomic(settlement_path, recorded)
+    payload.update({
+        "status": "attention_required",
+        "exit_code": int(payload.get("exit_code") or 1),
+        "session_authority": "pre_submit",
+        "terminal_harvested": False,
+        "artifact_sha256": None,
+        "transport_status": "not_submitted_commit_probe_proven",
+        "task_outcome": "not_executed",
+        "task_outcome_reason": "oracle-commit-probe-proven-no-submission",
+        "commit_probe_no_submission": {
+            "schema": "codex.chatgpt.oracle-settlement-reference/v1",
+            "path": str(settlement_path),
+            "sha256": sha256_file(settlement_path),
+        },
+    })
+    write_json_atomic(state_path, payload)
+    return payload
+
+
 def proven_user_confirmed_no_submission(state_path: Path) -> dict[str, Any] | None:
     """Revalidate a persisted user confirmation against immutable run artifacts."""
     state = load_state(state_path)
@@ -1707,6 +1917,11 @@ def proven_pre_submit_host_failure(state_path: Path) -> dict[str, Any] | None:
             "ORACLE_CLI_HASH_MISMATCH",
             "ORACLE_NODE_NOT_FOUND",
             "ORACLE_NODE_INVALID",
+            "ORACLE_NODE_ENGINE_INVALID",
+            "ORACLE_NODE_ENGINE_UNSUPPORTED",
+            "ORACLE_NODE_COMPATIBLE_NOT_FOUND",
+            "ORACLE_NODE_SELECTION_AMBIGUOUS",
+            "ORACLE_MATERIALIZED_COMMAND_INVALID",
         }
     ):
         failure_reason = "local-oracle-executable-unavailable"
@@ -2107,8 +2322,6 @@ def resolve_lifecycle(state: dict[str, Any], *, output_is_present: bool | None =
     else:
         has_output = bool(output_is_present)
 
-    if status == "abandoned":
-        return {"lifecycle": "abandoned", "authority_source": "explicit-abandonment"}
     # 1. Exact terminal web evidence.
     if authority == "settled_executed" and outcome == "executed":
         return {"lifecycle": "complete", "authority_source": "user-confirmed-execution-settlement"}
@@ -2127,6 +2340,8 @@ def resolve_lifecycle(state: dict[str, Any], *, output_is_present: bool | None =
     if authority in {"live", "submitted_unknown", "terminal_observed"}:
         return {"lifecycle": "running", "authority_source": "exact-session-ownership"}
     # 4. Local ledger, lowest authority.
+    if status == "abandoned":
+        return {"lifecycle": "abandoned", "authority_source": "explicit-abandonment"}
     if status == "complete":
         # A ledger that claims completion without a durable artifact has not
         # proven anything.  Never let the weakest authority assert completion.
@@ -2214,6 +2429,7 @@ def unresolved_project_sessions(
             continue
         authority = str(payload.get("session_authority") or "").strip().casefold()
         settlement_artifact = candidate.parent / "user-confirmed-no-submission.json"
+        commit_probe_settlement_artifact = candidate.parent / "commit-probe-no-submission.json"
         execution_settlement_artifact = candidate.parent / "user-confirmed-execution-ended.json"
         settlement_derived = (
             "user_confirmed_no_submission" in payload
@@ -2221,6 +2437,10 @@ def unresolved_project_sessions(
             or str(payload.get("task_outcome_reason") or "")
             == "user-confirmed-no-submission-after-prompt-timeout"
             or settlement_artifact.exists()
+            or "commit_probe_no_submission" in payload
+            or str(payload.get("transport_status") or "") == "not_submitted_commit_probe_proven"
+            or str(payload.get("task_outcome_reason") or "") == "oracle-commit-probe-proven-no-submission"
+            or commit_probe_settlement_artifact.exists()
         )
         execution_settlement_derived = (
             "user_confirmed_execution_ended" in payload
@@ -2233,6 +2453,7 @@ def unresolved_project_sessions(
             authority == "pre_submit"
             and settlement_derived
             and proven_user_confirmed_no_submission(candidate) is None
+            and proven_commit_probe_no_submission(candidate) is None
         ):
             # A missing or changed settlement artifact revokes the release and
             # restores fail-closed ownership before any new submission.

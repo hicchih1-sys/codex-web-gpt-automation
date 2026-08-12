@@ -116,9 +116,13 @@ def test_default_oracle_command_is_pinned_to_the_hash_validated_version() -> Non
 def test_pinned_npx_materializes_hash_verified_cached_cli_without_registry(tmp_path: Path) -> None:
     runner = load_runner()
     node = tmp_path / "node.exe"
-    cli = tmp_path / "oracle-cli.js"
+    cli = tmp_path / "oracle" / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
     node.write_bytes(b"node")
     cli.write_bytes(b"cli")
+    (tmp_path / "oracle" / "package.json").write_text(
+        json.dumps({"engines": {"node": ">=24"}}), encoding="utf-8"
+    )
     resolved_names: list[str] = []
 
     command = runner.materialize_oracle_command(
@@ -126,12 +130,116 @@ def test_pinned_npx_materializes_hash_verified_cached_cli_without_registry(tmp_p
         platform_name="nt",
         cli_resolver=lambda: cli,
         executable_resolver=lambda name: resolved_names.append(name) or str(node),
+        node_version_runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout="v25.5.0\n", stderr=""
+        ),
+        node_candidates=(),
     )
 
     assert command == [str(node.resolve()), str(cli.resolve())]
     assert resolved_names == ["node.exe"]
     assert Path(command[0]).name.casefold() == "node.exe"
     assert Path(command[1]).name == "oracle-cli.js"
+
+
+def test_materialization_rejects_node22_and_selects_existing_node25_from_package_engine(
+    tmp_path: Path,
+) -> None:
+    runner = load_runner()
+    package_root = tmp_path / "oracle"
+    cli = package_root / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"cli")
+    (package_root / "package.json").write_text(
+        json.dumps({"engines": {"node": ">=24"}}), encoding="utf-8"
+    )
+    node22 = tmp_path / "node22" / "node.exe"
+    node25 = tmp_path / "node25" / "node.exe"
+    node22.parent.mkdir()
+    node25.parent.mkdir()
+    node22.write_bytes(b"node22")
+    node25.write_bytes(b"node25")
+    probes: list[list[str]] = []
+
+    def node_version(command, **kwargs):
+        probes.append(list(command))
+        version = "v22.22.1" if Path(command[0]) == node22.resolve() else "v25.5.0"
+        return subprocess.CompletedProcess(command, 0, stdout=f"{version}\n", stderr="")
+
+    materialized = runner.materialize_oracle_command(
+        ["npx.cmd", "-y", "@steipete/oracle@0.17.1"],
+        platform_name="nt",
+        cli_resolver=lambda: cli,
+        executable_resolver=lambda name: str(node22),
+        node_version_runner=node_version,
+        node_candidates=(node25,),
+    )
+
+    assert materialized == [str(node25.resolve()), str(cli.resolve())]
+    assert probes == [[str(node22.resolve()), "--version"], [str(node25.resolve()), "--version"]]
+
+
+def test_materialization_fails_closed_when_no_node_satisfies_package_engine(tmp_path: Path) -> None:
+    runner = load_runner()
+    package_root = tmp_path / "oracle"
+    cli = package_root / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"cli")
+    (package_root / "package.json").write_text(
+        json.dumps({"engines": {"node": ">=24"}}), encoding="utf-8"
+    )
+    node22 = tmp_path / "node.exe"
+    node22.write_bytes(b"node22")
+
+    with pytest.raises(runner.OracleRunError) as exc_info:
+        runner.materialize_oracle_command(
+            ["npx.cmd", "-y", "@steipete/oracle@0.17.1"],
+            platform_name="nt",
+            cli_resolver=lambda: cli,
+            executable_resolver=lambda name: str(node22),
+            node_version_runner=lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 0, stdout="v22.22.1\n", stderr=""
+            ),
+            node_candidates=(),
+        )
+
+    assert exc_info.value.code == "ORACLE_NODE_COMPATIBLE_NOT_FOUND"
+    assert exc_info.value.evidence["required"] == ">=24"
+    assert exc_info.value.evidence["candidates"] == [
+        {"path": str(node22.resolve()), "version": "22.22.1", "compatible": False}
+    ]
+
+
+def test_materialization_fails_closed_when_multiple_nodes_satisfy_package_engine(tmp_path: Path) -> None:
+    runner = load_runner()
+    package_root = tmp_path / "oracle"
+    cli = package_root / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"cli")
+    (package_root / "package.json").write_text(
+        json.dumps({"engines": {"node": ">=24"}}), encoding="utf-8"
+    )
+    nodes = [tmp_path / "a" / "node.exe", tmp_path / "b" / "node.exe"]
+    for node in nodes:
+        node.parent.mkdir()
+        node.write_bytes(b"node")
+
+    with pytest.raises(runner.OracleRunError) as exc_info:
+        runner.materialize_oracle_command(
+            ["npx.cmd", "-y", "@steipete/oracle@0.17.1"],
+            platform_name="nt",
+            cli_resolver=lambda: cli,
+            executable_resolver=lambda name: str(nodes[0]),
+            node_version_runner=lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 0, stdout="v25.5.0\n", stderr=""
+            ),
+            node_candidates=(nodes[1],),
+        )
+
+    assert exc_info.value.code == "ORACLE_NODE_SELECTION_AMBIGUOUS"
+    assert [item["path"] for item in exc_info.value.evidence["compatible_candidates"]] == [
+        str(node.resolve()) for node in nodes
+    ]
 
 
 def test_execute_run_uses_materialized_command_for_version_and_launch(tmp_path: Path) -> None:
@@ -853,6 +961,9 @@ def test_recovery_uses_materialized_command_without_npx_registry(tmp_path: Path)
     cli.parent.mkdir(parents=True)
     node.write_bytes(b"node")
     cli.write_bytes(b"cli")
+    (tmp_path / "oracle" / "package.json").write_text(
+        json.dumps({"engines": {"node": ">=24"}}), encoding="utf-8"
+    )
     direct = [str(node.resolve()), str(cli.resolve())]
     initial = execute_run(
         runner,
@@ -861,6 +972,8 @@ def test_recovery_uses_materialized_command_without_npx_registry(tmp_path: Path)
         popen_factory=lambda command, **kwargs: Process(9, []),
         command_materializer=lambda command: direct,
     )
+    persisted = runner.STATE.load_state(Path(initial["run_dir"]) / "state.json")
+    assert persisted["oracle"]["materialized_command"] == direct
     captured: list[list[str]] = []
     compatibility: list[tuple[str, Path]] = []
     events: list[str] = []
@@ -879,8 +992,13 @@ def test_recovery_uses_materialized_command_without_npx_registry(tmp_path: Path)
         Path(initial["run_dir"]),
         action="harvest",
         popen_factory=recovery_process,
-        command_materializer=lambda command: direct,
+        command_materializer=lambda command: (_ for _ in ()).throw(
+            AssertionError("recovery must reuse the exact persisted materialized command")
+        ),
         recovery_compat_factory=recovery_compatibility,
+        node_version_runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout="v25.5.0\n", stderr=""
+        ),
     )
 
     assert captured
@@ -888,6 +1006,45 @@ def test_recovery_uses_materialized_command_without_npx_registry(tmp_path: Path)
     assert "npx.cmd" not in captured[0]
     assert compatibility == [("0.17.1", (tmp_path / "oracle").resolve())]
     assert events == ["compatibility", "popen"]
+
+
+def test_incompatible_node_fails_before_browser_process(tmp_path: Path) -> None:
+    runner = load_runner()
+    package_root = tmp_path / "oracle"
+    cli = package_root / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"cli")
+    (package_root / "package.json").write_text(
+        json.dumps({"engines": {"node": ">=24"}}), encoding="utf-8"
+    )
+    node22 = tmp_path / "node.exe"
+    node22.write_bytes(b"node22")
+
+    def materialize(command):
+        return runner.materialize_oracle_command(
+            command,
+            platform_name="nt",
+            cli_resolver=lambda: cli,
+            executable_resolver=lambda name: str(node22),
+            node_version_runner=lambda node_command, **kwargs: subprocess.CompletedProcess(
+                node_command, 0, stdout="v22.22.1\n", stderr=""
+            ),
+            node_candidates=(),
+        )
+
+    result = execute_run(
+        runner,
+        manifest(tmp_path, oracle_command=["npx.cmd", "-y", "@steipete/oracle@0.17.1"]),
+        command_materializer=materialize,
+        popen_factory=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("browser process must not launch without a compatible Node.js")
+        ),
+    )
+
+    assert result["status"] == "pre_submit_failed"
+    state = runner.STATE.load_state(Path(result["run_dir"]) / "state.json")
+    assert state["pre_submit_failure"]["code"] == "ORACLE_VERSION_RESOLUTION_PRELAUNCH_FAILED"
+    assert "ORACLE_NODE_COMPATIBLE_NOT_FOUND" in Path(state["artifacts"]["stderr"]).read_text(encoding="utf-8")
 
 
 def test_post_submit_response_timeout_retains_passive_live_authority(tmp_path: Path) -> None:
@@ -1797,10 +1954,7 @@ def test_user_confirmed_no_submission_is_hash_bound_idempotent_and_fail_closed(t
 
     # Any contradictory later recovery revokes the release even though the
     # original no-tab/no-URL recovery still exists.
-    (run_dir / "recovery-live-stdout.log").write_text(
-        "State: running\n",
-        encoding="utf-8",
-    )
+    (run_dir / "recovery-live-stdout.log").write_text("State: running\n", encoding="utf-8")
     (run_dir / "recovery-live-stderr.log").write_text("", encoding="utf-8")
     assert runner.STATE.proven_user_confirmed_no_submission(state_path) is None
     owners = runner.STATE.unresolved_project_sessions(
@@ -1810,6 +1964,146 @@ def test_user_confirmed_no_submission_is_hash_bound_idempotent_and_fail_closed(t
     )
     assert owners[0]["run_id"] == run_id
 
+
+def test_commit_probe_no_submission_is_hash_bound_idempotent_and_rejects_mismatch(
+    tmp_path: Path,
+) -> None:
+    runner = load_runner()
+    run_id = "c" * 32
+    workflow_id = "45368691-2b45-46da-8a3b-e7e16ac1aa19"
+    parallel_parent_id = hashlib.sha256(workflow_id.encode("utf-8")).hexdigest()
+    manifest_path = manifest(tmp_path, run_id=run_id, parallel_parent_id=parallel_parent_id)
+    input_mission = tmp_path / "input.md"
+    input_mission.write_text("bound input", encoding="utf-8")
+    input_sha = hashlib.sha256(input_mission.read_bytes()).hexdigest()
+    (tmp_path / "mission.md").write_text(
+        "\n".join((
+            "mission body", "", "[HOST_STAGE_CONTRACT]", f"workflow_id={workflow_id}",
+            "stage=implementation", f"attempt_id={run_id}", f"input_mission_sha256={input_sha}",
+            f"exact_project_root={tmp_path.resolve()}",
+            f"exact_input_mission_path={input_mission.resolve()}",
+            f"Write the small UTF-8 stage receipt to: {(tmp_path / 'stage-result.json').resolve()}",
+            "", "[DEVSPACE_WORKSPACE_ENTRY_CONTRACT]", "workspace body", "",
+        )),
+        encoding="utf-8",
+    )
+
+    def prompt_not_observed(command, **kwargs):
+        slug = command[command.index("--slug") + 1]
+        kwargs["stdout"].write((
+            f"Session: {slug}\nERROR: Prompt did not appear in conversation before timeout "
+            "(send may have failed)\n"
+        ).encode())
+        kwargs["stdout"].flush()
+        return Process(1, [])
+
+    failed = execute_run(runner, manifest_path, run_factory=version_runner, popen_factory=prompt_not_observed)
+    run_dir = Path(failed["run_dir"])
+    state = runner.STATE.load_state(run_dir / "state.json")
+    slug = state["oracle"]["slug"]
+    (run_dir / "recovery-harvest-stdout.log").write_text(
+        f'No live ChatGPT tab matched session "{slug}". Attempting recovery.\n', encoding="utf-8"
+    )
+    (run_dir / "recovery-harvest-stderr.log").write_text(
+        "Cannot recover conversation: session metadata has no recoverable ChatGPT conversation URL.\n",
+        encoding="utf-8",
+    )
+    session_root = tmp_path / ".oracle" / "sessions"
+    meta_path = session_root / slug / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta = {
+        "id": slug,
+        "status": "error",
+        "cwd": str(tmp_path.resolve()),
+        "browser": {"runtime": {
+            "userDataDir": str((run_dir / "browser-temp" / "oracle-browser-exact").resolve()),
+            "tabUrl": "https://chatgpt.com/",
+        }},
+        "options": {"slug": slug, "writeOutputPath": str((run_dir / "output.md").resolve())},
+        "error": {"details": {
+            "stage": "submit-prompt", "code": "prompt-commit-timeout",
+            "commitProbe": {
+                "baseline": 0, "turnsCount": 0, "userMatched": False,
+                "prefixMatched": False, "lastMatched": False, "hasNewTurn": False,
+                "stopVisible": False, "assistantVisible": False,
+                "composerCleared": False, "inConversation": False,
+            },
+        }},
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    meta_sha = hashlib.sha256(meta_path.read_bytes()).hexdigest()
+
+    def rejected(candidate, *, candidate_path=meta_path, expected_hash=None):
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+        digest = expected_hash or hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+        with pytest.raises(runner.OracleRunError, match="commit-probe"):
+            runner.settle_commit_probe_no_submission(
+                run_dir, meta_path=candidate_path, expected_meta_sha256=digest,
+                reason="negative binding case", session_root=session_root,
+            )
+
+    wrong_path = session_root / "oracle-project-other" / "meta.json"
+    rejected(meta, candidate_path=wrong_path)
+    rejected(meta, expected_hash="0" * 64)
+    for mutation in (
+        lambda value: value.update(id="oracle-project-other"),
+        lambda value: value["options"].update(slug="oracle-project-other"),
+        lambda value: value.update(cwd=str(tmp_path.parent.resolve())),
+        lambda value: value["browser"]["runtime"].update(userDataDir=str(tmp_path.resolve())),
+        lambda value: value["options"].update(writeOutputPath=str((run_dir / "other.md").resolve())),
+        lambda value: value["browser"]["runtime"].update(tabUrl="https://chatgpt.com/?x=1"),
+        lambda value: value.update(conversationUrl="https://chatgpt.com/c/forbidden"),
+    ):
+        candidate = json.loads(json.dumps(meta))
+        mutation(candidate)
+        rejected(candidate)
+    for field in (
+        "userMatched", "prefixMatched", "lastMatched", "hasNewTurn", "stopVisible",
+        "assistantVisible", "composerCleared", "inConversation",
+    ):
+        candidate = json.loads(json.dumps(meta))
+        candidate["error"]["details"]["commitProbe"][field] = True
+        rejected(candidate)
+    for field in ("baseline", "turnsCount"):
+        candidate = json.loads(json.dumps(meta))
+        candidate["error"]["details"]["commitProbe"][field] = 1
+        rejected(candidate)
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    meta_sha = hashlib.sha256(meta_path.read_bytes()).hexdigest()
+
+    settled = runner.settle_commit_probe_no_submission(
+        run_dir, meta_path=meta_path, expected_meta_sha256=meta_sha,
+        reason="immutable Oracle commit probe proves no conversation turn", session_root=session_root,
+    )
+    proof = runner.STATE.proven_commit_probe_no_submission(run_dir / "state.json", session_root=session_root)
+
+    assert settled["status"] == "pre_submit_commit_probe_proven"
+    assert settled["safe_for_fresh_run"] is True
+    assert settled["result"]["session_authority"] == "pre_submit"
+    assert settled["result"]["transport_status"] == "not_submitted_commit_probe_proven"
+    assert proof is not None and proof["meta_sha256"] == meta_sha
+    assert (run_dir / "commit-probe-no-submission.json").is_file()
+    repeated = runner.settle_commit_probe_no_submission(
+        run_dir, meta_path=meta_path, expected_meta_sha256=meta_sha,
+        reason="immutable Oracle commit probe proves no conversation turn", session_root=session_root,
+    )
+    assert repeated["result"] == settled["result"]
+
+    # A different exact session (B), even with the same negative probe, cannot settle A.
+    other_meta = {**meta, "id": "oracle-project-other"}
+    meta_path.write_text(json.dumps(other_meta), encoding="utf-8")
+    other_sha = hashlib.sha256(meta_path.read_bytes()).hexdigest()
+    with pytest.raises(runner.OracleRunError, match="commit-probe"):
+        runner.settle_commit_probe_no_submission(
+            run_dir, meta_path=meta_path, expected_meta_sha256=other_sha,
+            reason="wrong exact session", session_root=session_root,
+        )
+    assert runner.STATE.proven_commit_probe_no_submission(
+        run_dir / "state.json", session_root=session_root
+    ) is None
+    owners = runner.STATE.unresolved_project_sessions(run_dir.parent, tmp_path)
+    assert owners[0]["run_id"] == run_id
 
 def test_user_confirmation_rejects_bare_bindings_without_host_contract(tmp_path: Path) -> None:
     runner = load_runner()
