@@ -497,6 +497,22 @@ def test_owned_live_session_stays_running_despite_local_failure(tmp_path: Path) 
     assert verdict == {"lifecycle": "running", "authority_source": "exact-session-ownership"}
 
 
+def test_exact_session_ownership_outranks_abandoned_local_ledger(tmp_path: Path) -> None:
+    state = load_state()
+
+    verdict = state.resolve_lifecycle(
+        {
+            "status": "abandoned",
+            "session_authority": "submitted_unknown",
+            "terminal_harvested": False,
+            "artifacts": {"output": str(tmp_path / "missing.md")},
+        },
+        output_is_present=False,
+    )
+
+    assert verdict == {"lifecycle": "running", "authority_source": "exact-session-ownership"}
+
+
 def test_not_executed_outcome_needs_attention_even_when_terminal(tmp_path: Path) -> None:
     state = load_state()
     output = tmp_path / "output.md"
