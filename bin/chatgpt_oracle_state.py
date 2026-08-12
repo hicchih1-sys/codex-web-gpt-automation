@@ -1691,6 +1691,26 @@ def proven_pre_submit_host_failure(state_path: Path) -> dict[str, Any] | None:
     ):
         failure_reason = "version-resolution-timeout"
         code = "ORACLE_VERSION_RESOLUTION_PRELAUNCH_FAILED"
+    elif normalized_error.strip() == (
+        "version resolution failed: ORACLE_VERSION_FAILED: "
+        "Oracle version could not be resolved"
+    ):
+        failure_reason = "version-resolution-command-failed"
+        code = "ORACLE_VERSION_RESOLUTION_PRELAUNCH_FAILED"
+    elif any(
+        normalized_error.startswith(f"version resolution failed: {failure_code}:")
+        for failure_code in {
+            "ORACLE_PACKAGE_NOT_FOUND",
+            "ORACLE_PACKAGE_INVALID",
+            "ORACLE_PACKAGE_HASH_MISMATCH",
+            "ORACLE_CLI_INVALID",
+            "ORACLE_CLI_HASH_MISMATCH",
+            "ORACLE_NODE_NOT_FOUND",
+            "ORACLE_NODE_INVALID",
+        }
+    ):
+        failure_reason = "local-oracle-executable-unavailable"
+        code = "ORACLE_VERSION_RESOLUTION_PRELAUNCH_FAILED"
     else:
         return None
     return {
@@ -1988,6 +2008,7 @@ def settle_proven_pre_submit_failure(state_path: Path) -> dict[str, Any] | None:
                 "ORACLE_PROFILE_COPY_EBUSY_PRELAUNCH_FAILED",
                 "ORACLE_PROFILE_COPY_RSYNC_PRELAUNCH_FAILED",
                 "ORACLE_THINKING_TIME_PRE_SUBMIT_FAILED",
+                "ORACLE_VERSION_RESOLUTION_PRELAUNCH_FAILED",
                 "ORACLE_LAUNCH_FLAGS_MUTUALLY_EXCLUSIVE_PRELAUNCH_FAILED",
                 "ORACLE_MANUAL_LOGIN_PROFILE_UNINITIALIZED_PRELAUNCH_FAILED",
             }

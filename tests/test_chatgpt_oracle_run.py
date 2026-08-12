@@ -113,6 +113,69 @@ def test_default_oracle_command_is_pinned_to_the_hash_validated_version() -> Non
         runner.STATE.validate_oracle_command(["npx.cmd", "-y", "@steipete/oracle@0.17.0"])
 
 
+def test_pinned_npx_materializes_hash_verified_cached_cli_without_registry(tmp_path: Path) -> None:
+    runner = load_runner()
+    node = tmp_path / "node.exe"
+    cli = tmp_path / "oracle-cli.js"
+    node.write_bytes(b"node")
+    cli.write_bytes(b"cli")
+    resolved_names: list[str] = []
+
+    command = runner.materialize_oracle_command(
+        ["npx.cmd", "-y", "@steipete/oracle@0.17.1"],
+        platform_name="nt",
+        cli_resolver=lambda: cli,
+        executable_resolver=lambda name: resolved_names.append(name) or str(node),
+    )
+
+    assert command == [str(node.resolve()), str(cli.resolve())]
+    assert resolved_names == ["node.exe"]
+    assert Path(command[0]).name.casefold() == "node.exe"
+    assert Path(command[1]).name == "oracle-cli.js"
+
+
+def test_execute_run_uses_materialized_command_for_version_and_launch(tmp_path: Path) -> None:
+    runner = load_runner()
+    logical = ["npx.cmd", "-y", "@steipete/oracle@0.17.1"]
+    node = tmp_path / "node.exe"
+    cli = tmp_path / "oracle" / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
+    node.write_bytes(b"node")
+    cli.write_bytes(b"cli")
+    direct = [str(node.resolve()), str(cli.resolve())]
+    materialized: list[list[str]] = []
+    version_commands: list[list[str]] = []
+    compatibility: list[tuple[str, Path]] = []
+    captured: dict[str, object] = {}
+    events: list[str] = []
+
+    def materialize(command):
+        materialized.append(list(command))
+        return direct
+
+    def version(command, **kwargs):
+        version_commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, stdout="oracle 0.17.1\n", stderr="")
+
+    result = execute_run(
+        runner,
+        manifest(tmp_path, oracle_command=logical),
+        run_factory=version,
+        popen_factory=popen_for(0, b"answer", captured, events),
+        command_materializer=materialize,
+        compat_factory=lambda resolved, *, package_root: compatibility.append(
+            (resolved, package_root)
+        ) or {"ok": True},
+    )
+
+    assert result["ok"] is True
+    assert materialized == [logical]
+    assert version_commands == [[*direct, "--version"]]
+    assert compatibility == [("oracle 0.17.1", (tmp_path / "oracle").resolve())]
+    assert captured["command"][:2] == direct
+    assert "npx.cmd" not in captured["command"]
+
+
 def test_conversation_url_helpers_preserve_exact_binding_and_detect_conflicts(tmp_path: Path) -> None:
     runner = load_runner()
     observer = tmp_path / "recovery-live-stdout.log"
@@ -131,7 +194,7 @@ def test_conversation_url_helpers_preserve_exact_binding_and_detect_conflicts(tm
 
 
 def execute_run(runner, *args, **kwargs):
-    kwargs.setdefault("compat_factory", lambda version: {"ok": True, "version": version})
+    kwargs.setdefault("compat_factory", lambda version, **options: {"ok": True, "version": version})
     kwargs.setdefault(
         "devspace_compat_factory",
         lambda: {"ok": True, "changed": [], "service_restart_required": False},
@@ -493,7 +556,7 @@ def test_pro_readonly_dry_run_uses_devspace_preflight_without_file_transport(tmp
         pro_readonly_manifest(tmp_path),
         run_factory=version_0171_runner,
         popen_factory=popen_for(0, b"read-only answer\n", captured, []),
-        compat_factory=lambda version: {"ok": True, "version": version},
+        compat_factory=lambda version, **options: {"ok": True, "version": version},
         devspace_compat_factory=lambda: preflight_calls.append(True) or {
             "ok": True, "changed": [], "service_restart_required": False,
         },
@@ -698,7 +761,7 @@ def test_devspace_patch_change_blocks_before_submission_until_restart(
         manifest(tmp_path),
         run_factory=version_runner,
         popen_factory=lambda *args, **kwargs: launched.append(True),
-        compat_factory=lambda version: {"ok": True, "version": version},
+        compat_factory=lambda version, **options: {"ok": True, "version": version},
         devspace_compat_factory=lambda: {
             "ok": True,
             "changed": ["dist/workspaces.js"],
@@ -780,6 +843,51 @@ def test_post_submit_nonzero_requires_exact_recovery_and_never_restarts(tmp_path
         assert "--no-recover" not in recovery["argv"]
         assert "restart" not in recovery["argv"]
         assert "--prompt" not in recovery["argv"]
+
+
+def test_recovery_uses_materialized_command_without_npx_registry(tmp_path: Path) -> None:
+    runner = load_runner()
+    logical = ["npx.cmd", "-y", "@steipete/oracle@0.17.1"]
+    node = tmp_path / "node.exe"
+    cli = tmp_path / "oracle" / "dist" / "bin" / "oracle-cli.js"
+    cli.parent.mkdir(parents=True)
+    node.write_bytes(b"node")
+    cli.write_bytes(b"cli")
+    direct = [str(node.resolve()), str(cli.resolve())]
+    initial = execute_run(
+        runner,
+        manifest(tmp_path, oracle_command=logical),
+        run_factory=version_0171_runner,
+        popen_factory=lambda command, **kwargs: Process(9, []),
+        command_materializer=lambda command: direct,
+    )
+    captured: list[list[str]] = []
+    compatibility: list[tuple[str, Path]] = []
+    events: list[str] = []
+
+    def recovery_process(command, **kwargs):
+        events.append("popen")
+        captured.append(list(command))
+        return Process(1, [])
+
+    def recovery_compatibility(version, *, package_root):
+        events.append("compatibility")
+        compatibility.append((version, package_root))
+        return {"ok": True}
+
+    runner.recover_run(
+        Path(initial["run_dir"]),
+        action="harvest",
+        popen_factory=recovery_process,
+        command_materializer=lambda command: direct,
+        recovery_compat_factory=recovery_compatibility,
+    )
+
+    assert captured
+    assert captured[0][:2] == direct
+    assert "npx.cmd" not in captured[0]
+    assert compatibility == [("0.17.1", (tmp_path / "oracle").resolve())]
+    assert events == ["compatibility", "popen"]
 
 
 def test_post_submit_response_timeout_retains_passive_live_authority(tmp_path: Path) -> None:
@@ -1436,6 +1544,34 @@ def test_version_resolution_timeout_is_proven_pre_submit_and_releases_project(tm
         runner.STATE.load_manifest(manifest(tmp_path)).run_root,
         tmp_path,
     ) == []
+
+
+def test_version_resolution_nonzero_is_proven_pre_submit_and_releases_project(tmp_path: Path) -> None:
+    runner = load_runner()
+
+    def failed_version(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="npm error FetchError: request to https://registry.npmjs.org failed\n",
+        )
+
+    result = execute_run(
+        runner,
+        manifest(tmp_path, run_id="f" * 32),
+        run_factory=failed_version,
+        popen_factory=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Oracle must not launch after version command failure")
+        ),
+    )
+    state = runner.STATE.load_state(Path(result["run_dir"]) / "state.json")
+
+    assert result["status"] == "pre_submit_failed"
+    assert result["safe_for_fresh_run"] is True
+    assert state["session_authority"] == "pre_submit"
+    assert state["pre_submit_failure"]["code"] == "ORACLE_VERSION_RESOLUTION_PRELAUNCH_FAILED"
+    assert state["pre_submit_failure"]["failure_reason"] == "version-resolution-command-failed"
 
 
 def test_recovery_repairs_legacy_version_timeout_authority_without_oracle_call(tmp_path: Path) -> None:

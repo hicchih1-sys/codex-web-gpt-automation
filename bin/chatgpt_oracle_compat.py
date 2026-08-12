@@ -11,6 +11,9 @@ from typing import Any, Sequence
 
 SUPPORTED_VERSION = "0.17.1"
 CREATE_NO_WINDOW = 0x08000000
+ORACLE_CLI_ENTRY_RELATIVE = Path("dist/bin/oracle-cli.js")
+ORACLE_PACKAGE_JSON_SHA256 = "66ddaaf134ffb634936638e1e91aee5e4482f8064e5b9cf963fd73392e3a9ba8"
+ORACLE_CLI_ENTRY_SHA256 = "c2b39880451c467967c5fcd0e7c632c8b9bef96b7f30bf82b023ce8253fc96c2"
 # Retained only to document the old package lineage.  New work validates and
 # patches the published 0.17.1 package below; 0.16.1 is not accepted anymore.
 PATCHES_0161 = {
@@ -169,8 +172,15 @@ def _candidate_roots() -> list[Path]:
     override = str(os.environ.get("ORACLE_PACKAGE_ROOT") or "").strip()
     if override:
         return [Path(override).expanduser().resolve()]
-    local = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-    roots = list((local / "npm-cache" / "_npx").glob("*/node_modules/@steipete/oracle"))
+    npm_cache = str(os.environ.get("npm_config_cache") or "").strip()
+    if npm_cache:
+        cache_root = Path(npm_cache).expanduser()
+    elif os.name == "nt":
+        local = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        cache_root = local / "npm-cache"
+    else:
+        cache_root = Path.home() / ".npm"
+    roots = list((cache_root / "_npx").glob("*/node_modules/@steipete/oracle"))
     return sorted((path.resolve() for path in roots if path.is_dir()), key=lambda path: path.stat().st_mtime, reverse=True)
 
 
@@ -196,6 +206,52 @@ def resolve_package_roots(version: str = SUPPORTED_VERSION) -> list[Path]:
             {"version": version, "candidates": [str(path) for path in candidates[:8]]},
         )
     return matching
+
+
+def resolve_verified_cli_entry(*, package_root: Path | None = None) -> Path:
+    """Return the exact cached Oracle CLI only when its published bytes match."""
+    root = (
+        package_root.expanduser().resolve(strict=True)
+        if package_root is not None
+        else resolve_package_root(SUPPORTED_VERSION)
+    )
+    if package_version(root) != SUPPORTED_VERSION:
+        raise OracleCompatError(
+            "ORACLE_VERSION_UNVALIDATED",
+            "Oracle local execution is validated only for the tested version",
+            {"expected": SUPPORTED_VERSION, "root": str(root)},
+        )
+    package_json = root / "package.json"
+    if package_json.is_symlink() or sha256_file(package_json) != ORACLE_PACKAGE_JSON_SHA256:
+        raise OracleCompatError(
+            "ORACLE_PACKAGE_HASH_MISMATCH",
+            "Oracle package.json does not match the tested published package",
+            {"root": str(root), "expected": ORACLE_PACKAGE_JSON_SHA256},
+        )
+    cli_entry = root / ORACLE_CLI_ENTRY_RELATIVE
+    try:
+        resolved_entry = cli_entry.resolve(strict=True)
+        resolved_entry.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise OracleCompatError(
+            "ORACLE_CLI_INVALID",
+            "Oracle CLI entry is missing or outside the tested package",
+            {"root": str(root), "entry": str(cli_entry)},
+        ) from exc
+    if cli_entry.is_symlink() or not resolved_entry.is_file():
+        raise OracleCompatError(
+            "ORACLE_CLI_INVALID",
+            "Oracle CLI entry must be a regular package file",
+            {"root": str(root), "entry": str(cli_entry)},
+        )
+    actual = sha256_file(resolved_entry)
+    if actual != ORACLE_CLI_ENTRY_SHA256:
+        raise OracleCompatError(
+            "ORACLE_CLI_HASH_MISMATCH",
+            "Oracle CLI entry does not match the tested published package",
+            {"entry": str(resolved_entry), "expected": ORACLE_CLI_ENTRY_SHA256, "actual": actual},
+        )
+    return resolved_entry
 
 
 def patch_root() -> Path:

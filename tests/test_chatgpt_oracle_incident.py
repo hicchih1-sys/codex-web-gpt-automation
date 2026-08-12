@@ -133,6 +133,29 @@ def test_version_compatibility_drift_incident_is_safe_to_retry(tmp_path: Path) -
     assert packet["safe_for_fresh_run"] is True
 
 
+def test_version_command_failure_incident_is_classified_from_exact_prelaunch_evidence(
+    tmp_path: Path,
+) -> None:
+    module = load()
+    run_dir = write_run(tmp_path, "n" * 8, status="failed")
+    state_path = run_dir / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["oracle"] = {"resolved_version": "unresolved"}
+    state["session_authority"] = "pre_submit"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    (run_dir / "stderr.log").write_text(
+        "version resolution failed: ORACLE_VERSION_FAILED: "
+        "Oracle version could not be resolved\n",
+        encoding="utf-8",
+    )
+
+    packet = module.build_packet(run_dir)
+
+    assert packet["bucket"] == "pre-submit-host-environment"
+    assert packet["signature"] == "oracle-version-resolution-prelaunch-command-failed"
+    assert packet["safe_for_fresh_run"] is True
+
+
 def test_packet_never_marks_fresh_run_safe_while_another_session_owns_project(tmp_path: Path) -> None:
     module = load()
     failed = write_run(

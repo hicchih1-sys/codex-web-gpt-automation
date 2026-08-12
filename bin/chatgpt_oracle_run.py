@@ -230,8 +230,82 @@ def wait_for_oracle_process(process: Any, watchdog_timeout_seconds: float | None
 ORACLE_VERSION_RESOLUTION_TIMEOUT_SECONDS = 90
 
 
+def materialize_oracle_command(
+    command: Sequence[str],
+    *,
+    platform_name: str | None = None,
+    cli_resolver: Callable[[], Path] = COMPAT.resolve_verified_cli_entry,
+    executable_resolver: Callable[[str], str | None] = shutil.which,
+) -> list[str]:
+    """Replace the pinned npx spec with a hash-verified offline CLI command."""
+    validated = STATE.validate_oracle_command(list(command))
+    executable = Path(validated[0]).name.casefold()
+    if executable not in {"npx", "npx.cmd", "npx.exe"}:
+        return list(validated)
+    try:
+        cli_entry = Path(cli_resolver()).expanduser().resolve(strict=True)
+    except COMPAT.OracleCompatError as exc:
+        raise OracleRunError(exc.code, str(exc), exc.evidence) from exc
+    platform = os.name if platform_name is None else platform_name
+    node_name = "node.exe" if platform == "nt" else "node"
+    node_value = executable_resolver(node_name)
+    if not node_value:
+        raise OracleRunError(
+            "ORACLE_NODE_NOT_FOUND",
+            "Node.js is required to run the verified local Oracle package",
+            {"executable": node_name},
+        )
+    try:
+        node_path = Path(node_value).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise OracleRunError(
+            "ORACLE_NODE_INVALID",
+            "The resolved Node.js executable is unavailable",
+            {"executable": str(node_value)},
+        ) from exc
+    if not node_path.is_file():
+        raise OracleRunError(
+            "ORACLE_NODE_INVALID",
+            "The resolved Node.js executable is not a regular file",
+            {"executable": str(node_path)},
+        )
+    return [str(node_path), str(cli_entry)]
+
+
+def materialized_package_root(
+    logical_command: Sequence[str],
+    launch_command: Sequence[str],
+) -> Path | None:
+    """Bind a materialized npx command back to its exact Oracle package root."""
+    executable = Path(logical_command[0]).name.casefold()
+    if executable not in {"npx", "npx.cmd", "npx.exe"}:
+        return None
+    if len(launch_command) != 2:
+        raise OracleRunError(
+            "ORACLE_LOCAL_COMMAND_INVALID",
+            "The verified local Oracle command must contain Node.js and one CLI entry",
+        )
+    try:
+        cli_entry = Path(launch_command[1]).expanduser().resolve(strict=True)
+        package_root = cli_entry.parents[2]
+        relative = cli_entry.relative_to(package_root)
+    except (OSError, IndexError, ValueError) as exc:
+        raise OracleRunError(
+            "ORACLE_LOCAL_COMMAND_INVALID",
+            "The verified local Oracle CLI entry could not be rebound to its package",
+            {"entry": str(launch_command[1])},
+        ) from exc
+    if relative != COMPAT.ORACLE_CLI_ENTRY_RELATIVE:
+        raise OracleRunError(
+            "ORACLE_LOCAL_COMMAND_INVALID",
+            "The verified local Oracle CLI entry has an unexpected package path",
+            {"entry": str(cli_entry), "relative": relative.as_posix()},
+        )
+    return package_root
+
+
 def resolve_oracle_version(command: Sequence[str], *, run_factory=subprocess.run, platform_name: str | None = None) -> str:
-    """Resolve Oracle before launch with a bounded cold-cache allowance.
+    """Resolve Oracle before launch with a bounded local-process allowance.
 
     The returned value is still passed immediately to the exact 0.17.1
     compatibility/hash contract before a browser can be launched.
@@ -604,7 +678,8 @@ def execute_run(
     run_factory: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
     popen_factory: Callable[..., Any] = subprocess.Popen,
     platform_name: str | None = None,
-    compat_factory: Callable[[str], dict[str, Any]] = COMPAT.ensure_oracle_compatibility,
+    command_materializer: Callable[[Sequence[str]], Sequence[str]] | None = None,
+    compat_factory: Callable[..., dict[str, Any]] = COMPAT.ensure_oracle_compatibility,
     devspace_compat_factory: Callable[[], dict[str, Any]] = (
         DEVSPACE_COMPAT.ensure_devspace_compatibility
     ),
@@ -657,8 +732,18 @@ def execute_run(
     watchdog_expired = False
     oracle_process_pid: int | None = None
     try:
-        version = resolve_oracle_version(config.oracle_command, run_factory=run_factory, platform_name=platform_name)
-        compat_factory(version)
+        launch_command = list(
+            command_materializer(config.oracle_command)
+            if command_materializer is not None
+            else materialize_oracle_command(config.oracle_command, platform_name=platform_name)
+        )
+        argv = [*launch_command, *argv[len(config.oracle_command):]]
+        version = resolve_oracle_version(launch_command, run_factory=run_factory, platform_name=platform_name)
+        package_root = materialized_package_root(config.oracle_command, launch_command)
+        if package_root is None:
+            compat_factory(version)
+        else:
+            compat_factory(version, package_root=package_root)
         if STATE.is_devspace_transport(config.transport):
             devspace_compat = devspace_compat_factory()
             if devspace_compat.get("service_restart_required"):
@@ -934,6 +1019,8 @@ def _recover_run_locked(
     oracle_command: Sequence[str] | None = None,
     popen_factory: Callable[..., Any] = subprocess.Popen,
     platform_name: str | None = None,
+    command_materializer: Callable[[Sequence[str]], Sequence[str]] | None = None,
+    recovery_compat_factory: Callable[..., dict[str, Any]] = COMPAT.ensure_oracle_compatibility,
     live_settle_timeout_seconds: float = 0,
 ) -> dict[str, Any]:
     directory = run_dir.expanduser().resolve(strict=True)
@@ -1022,6 +1109,15 @@ def _recover_run_locked(
     argv = recovery_argv(command, locator, action, argv_output)
     if dry_run:
         return {"ok": True, "status": "dry-run", "run_dir": str(directory), "action": action, "argv": STATE.command_for_display(argv)}
+    launch_command = list(
+        command_materializer(command)
+        if command_materializer is not None
+        else materialize_oracle_command(command, platform_name=platform_name)
+    )
+    package_root = materialized_package_root(command, launch_command)
+    if package_root is not None:
+        recovery_compat_factory(COMPAT.SUPPORTED_VERSION, package_root=package_root)
+    argv = recovery_argv(launch_command, locator, action, argv_output)
     stdout_path = directory / f"recovery-{action}-stdout.log"
     stderr_path = directory / f"recovery-{action}-stderr.log"
     recovery_browser_temp = directory / f"recovery-{action}-browser-temp"
@@ -1534,6 +1630,8 @@ def recover_run(
     oracle_command: Sequence[str] | None = None,
     popen_factory: Callable[..., Any] = subprocess.Popen,
     platform_name: str | None = None,
+    command_materializer: Callable[[Sequence[str]], Sequence[str]] | None = None,
+    recovery_compat_factory: Callable[..., dict[str, Any]] = COMPAT.ensure_oracle_compatibility,
     settle_timeout_seconds: float = 0,
     settle_interval_seconds: float = 15,
     sleep: Callable[[float], None] = time.sleep,
@@ -1565,6 +1663,8 @@ def recover_run(
             oracle_command=oracle_command,
             popen_factory=popen_factory,
             platform_name=platform_name,
+            command_materializer=command_materializer,
+            recovery_compat_factory=recovery_compat_factory,
             live_settle_timeout_seconds=settle_timeout_seconds if action == "live" else 0,
         )
         if (
